@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'package:dio/dio.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:uni_links/uni_links.dart';
+import 'package:app_links/app_links.dart';
 import '../core/utils/pkce_util.dart';
 import '../core/utils/secure_storage_manager.dart';
 import '../core/constants/api_endpoints.dart';
@@ -11,7 +11,8 @@ import '../data/api_client.dart';
 /// OAuth 2.0 + PKCE 인증 서비스
 class OAuthService {
   final ApiClient _apiClient = ApiClient();
-  StreamSubscription? _linkSubscription;
+  final AppLinks _appLinks = AppLinks();
+  StreamSubscription<Uri>? _linkSubscription;
 
   // OAuth 콜백 컴플리터
   Completer<OAuthResult>? _authCompleter;
@@ -20,7 +21,7 @@ class OAuthService {
   Future<void> initializeDeepLinkListener() async {
     // 앱이 종료된 상태에서 딥링크로 실행된 경우
     try {
-      final initialUri = await getInitialUri();
+      final initialUri = await _appLinks.getInitialLink();
       if (initialUri != null) {
         _handleDeepLink(initialUri);
       }
@@ -29,11 +30,9 @@ class OAuthService {
     }
 
     // 앱이 실행 중일 때 딥링크 수신
-    _linkSubscription = uriLinkStream.listen(
-      (Uri? uri) {
-        if (uri != null) {
-          _handleDeepLink(uri);
-        }
+    _linkSubscription = _appLinks.uriLinkStream.listen(
+      (Uri uri) {
+        _handleDeepLink(uri);
       },
       onError: (err) {
         print('Deep link error: $err');
@@ -140,6 +139,15 @@ class OAuthService {
       return;
     }
 
+    // 이미 처리 완료된 경우 무시 (동시 호출 방지)
+    if (_authCompleter == null || _authCompleter!.isCompleted) {
+      return;
+    }
+
+    // completer를 가져오고 즉시 null로 설정 (중복 처리 방지)
+    final completer = _authCompleter!;
+    _authCompleter = null;
+
     // 인앱 브라우저 닫기
     closeInAppWebView();
 
@@ -147,7 +155,7 @@ class OAuthService {
     final error = uri.queryParameters['error'];
     if (error != null) {
       final errorDescription = uri.queryParameters['error_description'] ?? '인증이 취소되었습니다.';
-      _authCompleter?.completeError(
+      completer.completeError(
         AppException.oauth(
           message: error,
           userMessage: errorDescription,
@@ -161,7 +169,7 @@ class OAuthService {
     final state = uri.queryParameters['state'];
 
     if (code == null) {
-      _authCompleter?.completeError(
+      completer.completeError(
         AppException.oauth(
           message: 'No authorization code',
           userMessage: '인증 코드를 받지 못했습니다.',
@@ -173,7 +181,7 @@ class OAuthService {
     // State 검증 (CSRF 방지)
     final savedState = await SecureStorageManager.getOAuthState();
     if (state != savedState) {
-      _authCompleter?.completeError(
+      completer.completeError(
         AppException.oauth(
           message: 'State mismatch',
           userMessage: '보안 검증에 실패했습니다. 다시 시도해주세요.',
@@ -185,9 +193,9 @@ class OAuthService {
     // 토큰 교환
     try {
       final result = await exchangeCodeForToken(code);
-      _authCompleter?.complete(result);
+      completer.complete(result);
     } catch (e) {
-      _authCompleter?.completeError(e);
+      completer.completeError(e);
     }
   }
 
