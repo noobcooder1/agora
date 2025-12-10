@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
 import '../../../core/theme.dart';
 import 'invite_user_screen.dart';
 import 'package:flutter/services.dart';
@@ -9,48 +9,63 @@ import 'dart:typed_data';
 import 'dart:async';
 import '../../../core/utils/file_download_helper.dart';
 import '../widgets/voice_recorder_dialog.dart';
+import '../models/chat_message.dart' as local;
+import '../widgets/message_bubble.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'media_gallery_screen.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../shared/providers/chat_provider.dart';
+import '../../../shared/providers/file_provider.dart';
+import '../../../shared/providers/riverpod_profile_provider.dart';
+import '../../../services/websocket_service.dart';
+import '../../../data/api_client.dart';
+import '../../../data/models/chat/chat.dart';
 
-class ConversationScreen extends StatefulWidget {
+class ConversationScreen extends ConsumerStatefulWidget {
+  final String chatId;
   final String userName;
   final String userImage;
   final bool isTeam;
 
   const ConversationScreen({
     Key? key,
+    required this.chatId,
     required this.userName,
     required this.userImage,
     this.isTeam = false,
   }) : super(key: key);
 
   @override
-  State<ConversationScreen> createState() => _ConversationScreenState();
+  ConsumerState<ConversationScreen> createState() => _ConversationScreenState();
 }
 
-class _ConversationScreenState extends State<ConversationScreen> {
+class _ConversationScreenState extends ConsumerState<ConversationScreen> {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   final TextEditingController _messageController = TextEditingController();
   final TextEditingController _searchController = TextEditingController();
-  final List<ChatMessage> _messages = [];
+  final List<local.ChatMessage> _messages = [];
   final ScrollController _scrollController = ScrollController();
   bool _showSearch = false;
-  List<ChatMessage> _searchResults = [];
+  List<local.ChatMessage> _searchResults = [];
   List<XFile> _selectedImages = []; // Changed from single to list
   List<PlatformFile> _selectedFiles = []; // Changed from single to list
   String? _selectedVoiceMemo;
   int _voiceMemoDuration = 0;
-  
+
   // 음성 메모 미리보기 재생용
   final AudioPlayer _previewAudioPlayer = AudioPlayer();
   bool _isPreviewPlaying = false;
   Duration _previewCurrentPosition = Duration.zero;
   Duration _previewTotalDuration = Duration.zero;
 
+  // WebSocket 연결 여부
+  bool _isWebSocketInitialized = false;
+  WebSocketService? _webSocketService;
+
   @override
   void initState() {
     super.initState();
-    
+
     // 미리보기 오디오 플레이어 리스너 설정
     _previewAudioPlayer.onPlayerStateChanged.listen((state) {
       if (mounted) {
@@ -84,29 +99,41 @@ class _ConversationScreenState extends State<ConversationScreen> {
         });
       }
     });
-    
-    // Dummy messages
-    _messages.addAll([
-      ChatMessage(
-        text: "안녕하세요! 오늘 일정 확인하셨나요?",
-        isMe: false,
-        time: DateTime.now().subtract(const Duration(minutes: 5)),
-      ),
-      ChatMessage(
-        text: "네, 확인했습니다. 2시에 회의 맞죠?",
-        isMe: true,
-        time: DateTime.now().subtract(const Duration(minutes: 4)),
-      ),
-      ChatMessage(
-        text: "네 맞습니다. 회의실 A에서 뵙겠습니다.",
-        isMe: false,
-        time: DateTime.now().subtract(const Duration(minutes: 3)),
-      ),
-    ]);
+
+    // WebSocket 연결 및 채팅방 구독 (WidgetsBinding 이후)
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initializeWebSocket();
+      // 화면 진입 시 읽음 처리
+      _markAsRead();
+    });
+  }
+
+  void _initializeWebSocket() {
+    if (_isWebSocketInitialized) return;
+
+    _webSocketService = ref.read(webSocketServiceProvider);
+
+    // WebSocket 연결 (이미 연결되어 있으면 무시됨)
+    _webSocketService!.connect();
+
+    // 채팅방 구독
+    _webSocketService!.subscribeToChatRoom(widget.chatId);
+
+    _isWebSocketInitialized = true;
+  }
+
+  void _markAsRead() {
+    // 메시지 읽음 처리
+    ref.read(messageListProvider(widget.chatId).notifier).markAsRead();
   }
 
   @override
   void dispose() {
+    // WebSocket 구독 해제
+    if (_isWebSocketInitialized && _webSocketService != null) {
+      _webSocketService!.unsubscribeFromChatRoom(widget.chatId);
+    }
+
     _previewAudioPlayer.dispose();
     _messageController.dispose();
     _searchController.dispose();
@@ -118,80 +145,113 @@ class _ConversationScreenState extends State<ConversationScreen> {
     if (text.trim().isEmpty && _selectedImages.isEmpty && _selectedFiles.isEmpty && _selectedVoiceMemo == null) return;
 
     try {
-      // Convert multiple images to bytes
-      List<Uint8List>? imageBytesList;
-      if (_selectedImages.isNotEmpty) {
-        imageBytesList = [];
-        for (var image in _selectedImages) {
-          final bytes = await image.readAsBytes();
-          imageBytesList.add(bytes);
-          print('📸 Image processed: ${bytes.length} bytes');
+      List<String>? fileIds;
+
+      // 이미지나 파일이 있는 경우 파일 업로드 서비스 호출
+      if (_selectedImages.isNotEmpty || _selectedFiles.isNotEmpty) {
+        fileIds = await _uploadFiles();
+        if (fileIds == null || fileIds.isEmpty) {
+          // 업로드 실패 시 중단
+          return;
         }
-        print('📸 Total images processed: ${imageBytesList.length}');
       }
 
-      // Convert multiple files to a list
-      List<Map<String, dynamic>>? filesList;
-      if (_selectedFiles.isNotEmpty) {
-        filesList = [];
-        for (var file in _selectedFiles) {
-          Uint8List? fileBytes;
-          if (file.bytes != null) {
-            fileBytes = file.bytes;
-          } else if (file.path != null) {
-            fileBytes = await File(file.path!).readAsBytes();
-          }
-          
-          filesList.add({
-            'name': file.name,
-            'size': file.size,
-            'path': file.path,
-            'bytes': fileBytes,
-          });
-          print('📎 File processed: ${file.name}, ${file.size} bytes');
+      // 메시지 타입 결정
+      MessageType messageType = MessageType.text;
+      String messageContent = text.trim().isEmpty ? "음성 메모" : text;
+
+      if (_selectedVoiceMemo != null) {
+        // 음성 메모의 경우 파일 업로드 후 FILE 타입으로 전송
+        final voiceFile = File(_selectedVoiceMemo!);
+        final voiceFileIds = await _uploadFiles(voiceFiles: [voiceFile]);
+        if (voiceFileIds == null || voiceFileIds.isEmpty) {
+          return;
         }
-        print('📎 Total files processed: ${filesList.length}');
+        fileIds = voiceFileIds;
+        messageType = MessageType.file;
+      } else if (_selectedImages.isNotEmpty) {
+        messageType = MessageType.image;
+      } else if (_selectedFiles.isNotEmpty) {
+        messageType = MessageType.file;
       }
 
+      // WebSocket으로 메시지 전송
+      final notifier = ref.read(messageListProvider(widget.chatId).notifier);
+      notifier.sendMessage(
+        content: messageContent,
+        type: messageType,
+        fileIds: fileIds,
+      );
+
+      // 입력 필드 초기화
       _messageController.clear();
       setState(() {
-        print('📤 Sending message: images=${imageBytesList?.length}, files=${filesList?.length}, voice=${_selectedVoiceMemo}');
-        _messages.insert(
-            0,
-            ChatMessage(
-              text: _selectedVoiceMemo != null ? "음성 메모" : text,
-              isMe: true,
-              time: DateTime.now(),
-              imageBytesList: imageBytesList,
-              filesList: filesList,
-              audioPath: _selectedVoiceMemo,
-              audioDuration: _selectedVoiceMemo != null ? Duration(seconds: _voiceMemoDuration) : null,
-            ));
         _selectedImages = [];
         _selectedFiles = [];
         _selectedVoiceMemo = null;
         _voiceMemoDuration = 0;
-      });
-
-      // Auto-reply simulation
-      Future.delayed(const Duration(seconds: 1), () {
-        if (mounted) {
-          setState(() {
-            _messages.insert(
-                0,
-                ChatMessage(
-                  text: "자동 응답입니다. 잠시 후 다시 연락드리겠습니다.",
-                  isMe: false,
-                  time: DateTime.now(),
-                ));
-          });
-        }
       });
     } catch (e) {
       print('❌ Error sending message: $e');
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('메시지 전송 중 오류가 발생했습니다: $e')),
       );
+    }
+  }
+
+  /// 파일 업로드 헬퍼 메서드
+  Future<List<String>?> _uploadFiles({List<File>? voiceFiles}) async {
+    try {
+      final fileService = ref.read(fileServiceProvider);
+      final uploadedFileIds = <String>[];
+
+      // 이미지 업로드
+      if (_selectedImages.isNotEmpty) {
+        for (final image in _selectedImages) {
+          final imageFile = File(image.path);
+          final result = await fileService.uploadImage(imageFile);
+
+          result.when(
+            success: (fileResponse) => uploadedFileIds.add(fileResponse.file.id),
+            failure: (error) => throw error,
+          );
+        }
+      }
+
+      // 일반 파일 업로드
+      if (_selectedFiles.isNotEmpty) {
+        for (final platformFile in _selectedFiles) {
+          if (platformFile.path != null) {
+            final file = File(platformFile.path!);
+            final result = await fileService.uploadFile(file);
+
+            result.when(
+              success: (fileResponse) => uploadedFileIds.add(fileResponse.file.id),
+              failure: (error) => throw error,
+            );
+          }
+        }
+      }
+
+      // 음성 파일 업로드
+      if (voiceFiles != null && voiceFiles.isNotEmpty) {
+        for (final voiceFile in voiceFiles) {
+          final result = await fileService.uploadFile(voiceFile);
+
+          result.when(
+            success: (fileResponse) => uploadedFileIds.add(fileResponse.file.id),
+            failure: (error) => throw error,
+          );
+        }
+      }
+
+      return uploadedFileIds;
+    } catch (e) {
+      print('❌ Error uploading files: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('파일 업로드 중 오류가 발생했습니다: $e')),
+      );
+      return null;
     }
   }
 
@@ -289,8 +349,121 @@ class _ConversationScreenState extends State<ConversationScreen> {
     });
   }
 
+  /// API ChatMessage를 local ChatMessage로 변환
+  local.ChatMessage _convertToLocalMessage(ChatMessage apiMessage, String currentUserId) {
+    return local.ChatMessage(
+      text: apiMessage.content,
+      isMe: apiMessage.senderAgoraId == currentUserId,
+      time: apiMessage.createdAt,
+      sender: apiMessage.displayName,
+      // TODO: 첨부파일 처리
+      // imageUrl: apiMessage.attachments?.firstWhere((a) => a.mimeType.startsWith('image'))?.fileUrl,
+      // fileName: apiMessage.attachments?.firstWhere((a) => !a.mimeType.startsWith('image'))?.fileName,
+    );
+  }
+
+  /// 메시지 목록 빌드
+  Widget _buildMessageList() {
+    final messageState = ref.watch(messageListProvider(widget.chatId));
+
+    // 로딩 중
+    if (messageState.isLoading && messageState.messages.isEmpty) {
+      return const Center(
+        child: CircularProgressIndicator(),
+      );
+    }
+
+    // 에러 발생
+    if (messageState.error != null && messageState.messages.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.error_outline, size: 48, color: Colors.red),
+            const SizedBox(height: 16),
+            Text(
+              messageState.error!,
+              style: const TextStyle(color: Colors.red),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 16),
+            ElevatedButton(
+              onPressed: () {
+                ref.read(messageListProvider(widget.chatId).notifier).loadMessages();
+              },
+              child: const Text('다시 시도'),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // 메시지 목록 표시
+    final messages = messageState.messages;
+
+    // 현재 사용자 ID (프로필 Provider에서 가져오기)
+    final myProfile = ref.watch(myProfileProvider);
+    final currentUserId = myProfile.when(
+      data: (profile) => profile?.agoraId ?? 'me',
+      loading: () => 'me',
+      error: (_, __) => 'me',
+    );
+
+    return NotificationListener<ScrollNotification>(
+      onNotification: (ScrollNotification scrollInfo) {
+        // 스크롤이 맨 아래에 도달하면 더 불러오기
+        if (!messageState.isLoading &&
+            messageState.hasMore &&
+            scrollInfo.metrics.pixels >= scrollInfo.metrics.maxScrollExtent - 200) {
+          ref.read(messageListProvider(widget.chatId).notifier).loadMessages(loadMore: true);
+        }
+        return false;
+      },
+      child: ListView.builder(
+        reverse: true,
+        controller: _scrollController,
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+        itemCount: messages.length + (messageState.hasMore ? 1 : 0),
+        itemBuilder: (context, index) {
+          // 더 불러오기 인디케이터
+          if (index == messages.length) {
+            return const Center(
+              child: Padding(
+                padding: EdgeInsets.all(16.0),
+                child: CircularProgressIndicator(),
+              ),
+            );
+          }
+
+          final apiMessage = messages[index];
+          final localMessage = _convertToLocalMessage(apiMessage, currentUserId);
+
+          return MessageBubble(
+            key: ValueKey(apiMessage.id),
+            message: localMessage.text,
+            isMe: localMessage.isMe,
+            time: localMessage.time,
+            userImage: widget.userImage,
+            senderName: localMessage.sender ?? widget.userName,
+            imageUrl: localMessage.imageUrl,
+            fileName: localMessage.fileName,
+            fileSize: localMessage.fileSize,
+            reactions: localMessage.reactions,
+            onReactionSelected: (emoji) {
+              // TODO: 리액션 API 연동
+              print('Reaction selected: $emoji for message ${apiMessage.id}');
+            },
+          );
+        },
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    // WebSocket 연결 상태 감지
+    final connectionState = ref.watch(webSocketConnectionStateProvider);
+
     return Scaffold(
       key: _scaffoldKey,
       backgroundColor: AppTheme.backgroundColor,
@@ -327,27 +500,55 @@ class _ConversationScreenState extends State<ConversationScreen> {
                   : null,
             ),
             const SizedBox(width: 12),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  widget.userName,
-                  style: const TextStyle(
-                    color: AppTheme.textPrimary,
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                if (widget.isTeam)
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
                   Text(
-                    'Team',
-                    style: TextStyle(
-                      color: AppTheme.textSecondary,
-                      fontSize: 12,
+                    widget.userName,
+                    style: const TextStyle(
+                      color: AppTheme.textPrimary,
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
-              ],
+                  if (widget.isTeam)
+                    Text(
+                      'Team',
+                      style: TextStyle(
+                        color: AppTheme.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
+                ],
+              ),
             ),
+            // WebSocket 연결 상태 표시
+            connectionState.when(
+              data: (state) {
+                switch (state) {
+                  case WebSocketConnectionState.connected:
+                    return const Icon(Icons.circle, color: Colors.green, size: 12);
+                  case WebSocketConnectionState.connecting:
+                    return const SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    );
+                  case WebSocketConnectionState.error:
+                    return const Icon(Icons.circle, color: Colors.red, size: 12);
+                  default:
+                    return const Icon(Icons.circle, color: Colors.grey, size: 12);
+                }
+              },
+              loading: () => const SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              error: (_, __) => const Icon(Icons.circle, color: Colors.red, size: 12),
+            ),
+            const SizedBox(width: 8),
           ],
         ),
         actions: [
@@ -518,11 +719,13 @@ class _ConversationScreenState extends State<ConversationScreen> {
                         size: 14, color: AppTheme.textSecondary),
                     onTap: () {
                       Navigator.pop(context);
+                      // TODO: MediaGalleryScreen을 API 메시지와 호환되도록 수정 필요
+                      // 현재는 local ChatMessage 모델을 사용하므로 임시로 빈 리스트 전달
                       Navigator.push(
                         context,
                         MaterialPageRoute(
                           builder: (context) => MediaGalleryScreen(
-                            messages: _messages,
+                            messages: [], // TODO: API 메시지를 local 메시지로 변환 필요
                             initialTabIndex: 0,
                           ),
                         ),
@@ -530,32 +733,31 @@ class _ConversationScreenState extends State<ConversationScreen> {
                     },
                   ),
                   // Media Preview Section
-                  Builder(
-                    builder: (context) {
-                      // Collect all images from both imageBytes and imageBytesList
-                      final List<Uint8List> allImages = [];
-                      
-                      for (var message in _messages) {
-                        if (message.imageBytesList != null && message.imageBytesList!.isNotEmpty) {
-                          allImages.addAll(message.imageBytesList!);
-                        } else if (message.imageBytes != null) {
-                          allImages.add(message.imageBytes!);
-                        }
-                      }
-                      
-                      if (allImages.isEmpty) {
+                  Consumer(
+                    builder: (context, ref, child) {
+                      final messageState = ref.watch(messageListProvider(widget.chatId));
+
+                      // API 메시지에서 이미지 첨부파일 필터링
+                      final imageAttachments = messageState.messages
+                          .where((msg) => msg.attachments != null)
+                          .expand((msg) => msg.attachments!)
+                          .where((att) => att.mimeType.startsWith('image'))
+                          .take(5)
+                          .toList();
+
+                      if (imageAttachments.isEmpty) {
                         return const SizedBox.shrink();
                       }
-                      
+
                       return Container(
                         padding: const EdgeInsets.all(16),
                         child: SizedBox(
                           height: 100,
                           child: ListView.builder(
                             scrollDirection: Axis.horizontal,
-                            itemCount: allImages.take(5).length,
+                            itemCount: imageAttachments.length,
                             itemBuilder: (context, index) {
-                              final imageBytes = allImages[index];
+                              final attachment = imageAttachments[index];
                               return GestureDetector(
                                 onTap: () {
                                   Navigator.pop(context);
@@ -563,10 +765,13 @@ class _ConversationScreenState extends State<ConversationScreen> {
                                     context,
                                     MaterialPageRoute(
                                       builder: (_) => Scaffold(
-                                        appBar: AppBar(backgroundColor: Colors.black, iconTheme: const IconThemeData(color: Colors.white)),
+                                        appBar: AppBar(
+                                          backgroundColor: Colors.black,
+                                          iconTheme: const IconThemeData(color: Colors.white),
+                                        ),
                                         backgroundColor: Colors.black,
                                         body: Center(
-                                          child: Image.memory(imageBytes),
+                                          child: Image.network(attachment.fileUrl),
                                         ),
                                       ),
                                     ),
@@ -578,7 +783,9 @@ class _ConversationScreenState extends State<ConversationScreen> {
                                   decoration: BoxDecoration(
                                     borderRadius: BorderRadius.circular(8),
                                     image: DecorationImage(
-                                      image: MemoryImage(imageBytes),
+                                      image: NetworkImage(
+                                        attachment.thumbnailUrl ?? attachment.fileUrl,
+                                      ),
                                       fit: BoxFit.cover,
                                     ),
                                   ),
@@ -598,11 +805,12 @@ class _ConversationScreenState extends State<ConversationScreen> {
                         size: 14, color: AppTheme.textSecondary),
                     onTap: () {
                       Navigator.pop(context);
+                      // TODO: MediaGalleryScreen을 API 메시지와 호환되도록 수정 필요
                       Navigator.push(
                         context,
                         MaterialPageRoute(
                           builder: (context) => MediaGalleryScreen(
-                            messages: _messages,
+                            messages: [], // TODO: API 메시지를 local 메시지로 변환 필요
                             initialTabIndex: 1,
                           ),
                         ),
@@ -617,11 +825,12 @@ class _ConversationScreenState extends State<ConversationScreen> {
                         size: 14, color: AppTheme.textSecondary),
                     onTap: () {
                       Navigator.pop(context);
+                      // TODO: MediaGalleryScreen을 API 메시지와 호환되도록 수정 필요
                       Navigator.push(
                         context,
                         MaterialPageRoute(
                           builder: (context) => MediaGalleryScreen(
-                            messages: _messages,
+                            messages: [], // TODO: API 메시지를 local 메시지로 변환 필요
                             initialTabIndex: 2,
                           ),
                         ),
@@ -714,60 +923,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
               ),
             ),
           Expanded(
-            child: _searchResults.isNotEmpty
-                ? ListView.builder(
-                    reverse: true,
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 16, vertical: 20),
-                    itemCount: _searchResults.length,
-                    itemBuilder: (context, index) {
-                      final message = _searchResults[index];
-                      return MessageBubble(
-                        message: message.text,
-                        isMe: message.isMe,
-                        time: message.time,
-                        userImage: widget.userImage,
-                        senderName: widget.userName,
-                        imageBytes: message.imageBytes,
-                        imageBytesList: message.imageBytesList,
-                        imageUrl: message.imageUrl,
-                        fileName: message.fileName,
-                        fileSize: message.fileSize,
-                        filePath: message.filePath,
-                        fileBytes: message.fileBytes,
-                        filesList: message.filesList,
-                        audioPath: message.audioPath,
-                        audioDuration: message.audioDuration,
-                      );
-                    },
-                  )
-                : ListView.builder(
-                    reverse: true,
-                    controller: _scrollController,
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 16, vertical: 20),
-                    itemCount: _messages.length,
-                    itemBuilder: (context, index) {
-                      final message = _messages[index];
-                      return MessageBubble(
-                        message: message.text,
-                        isMe: message.isMe,
-                        time: message.time,
-                        userImage: widget.userImage,
-                        senderName: widget.userName,
-                        imageBytes: message.imageBytes,
-                        imageBytesList: message.imageBytesList,
-                        imageUrl: message.imageUrl,
-                        fileName: message.fileName,
-                        fileSize: message.fileSize,
-                        filePath: message.filePath,
-                        fileBytes: message.fileBytes,
-                        filesList: message.filesList,
-                        audioPath: message.audioPath,
-                        audioDuration: message.audioDuration,
-                      );
-                    },
-                  ),
+            child: _buildMessageList(),
           ),
           _buildInputArea(),
         ],
@@ -959,11 +1115,12 @@ class _ConversationScreenState extends State<ConversationScreen> {
               trailing: const Icon(Icons.arrow_forward_ios, size: 16),
               onTap: () {
                 Navigator.pop(context);
+                // TODO: MediaGalleryScreen을 API 메시지와 호환되도록 수정 필요
                 Navigator.push(
                   context,
                   MaterialPageRoute(
                     builder: (context) => MediaGalleryScreen(
-                      messages: _messages,
+                      messages: [], // TODO: API 메시지를 local 메시지로 변환 필요
                       initialTabIndex: 0,
                     ),
                   ),
@@ -976,11 +1133,12 @@ class _ConversationScreenState extends State<ConversationScreen> {
               trailing: const Icon(Icons.arrow_forward_ios, size: 16),
               onTap: () {
                 Navigator.pop(context);
+                // TODO: MediaGalleryScreen을 API 메시지와 호환되도록 수정 필요
                 Navigator.push(
                   context,
                   MaterialPageRoute(
                     builder: (context) => MediaGalleryScreen(
-                      messages: _messages,
+                      messages: [], // TODO: API 메시지를 local 메시지로 변환 필요
                       initialTabIndex: 1,
                     ),
                   ),
@@ -993,11 +1151,12 @@ class _ConversationScreenState extends State<ConversationScreen> {
               trailing: const Icon(Icons.arrow_forward_ios, size: 16),
               onTap: () {
                 Navigator.pop(context);
+                // TODO: MediaGalleryScreen을 API 메시지와 호환되도록 수정 필요
                 Navigator.push(
                   context,
                   MaterialPageRoute(
                     builder: (context) => MediaGalleryScreen(
-                      messages: _messages,
+                      messages: [], // TODO: API 메시지를 local 메시지로 변환 필요
                       initialTabIndex: 2,
                     ),
                   ),
@@ -1378,669 +1537,6 @@ class _ConversationScreenState extends State<ConversationScreen> {
             ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class ChatMessage {
-  final String text;
-  final bool isMe;
-  final DateTime time;
-  final Uint8List? imageBytes; // Single image (backward compatibility)
-  final List<Uint8List>? imageBytesList; // Multiple images
-  final String? imageUrl;
-  final String? fileName; // Single file (backward compatibility)
-  final int? fileSize; // Single file (backward compatibility)
-  final String? filePath; // Single file (backward compatibility)
-  final Uint8List? fileBytes; // Single file (backward compatibility)
-  final List<Map<String, dynamic>>? filesList; // Multiple files
-  final String? audioPath;
-  final Duration? audioDuration;
-
-  ChatMessage({
-    required this.text,
-    required this.isMe,
-    required this.time,
-    this.imageBytes,
-    this.imageBytesList,
-    this.imageUrl,
-    this.fileName,
-    this.fileSize,
-    this.filePath,
-    this.fileBytes,
-    this.filesList,
-    this.audioPath,
-    this.audioDuration,
-  });
-}
-
-class MessageBubble extends StatefulWidget {
-  final String message;
-  final bool isMe;
-  final DateTime time;
-  final String? userImage;
-  final String senderName;
-  final Uint8List? imageBytes; // Single image (backward compatibility)
-  final List<Uint8List>? imageBytesList; // Multiple images
-  final String? imageUrl;
-  final String? fileName; // Single file (backward compatibility)
-  final int? fileSize; // Single file (backward compatibility)
-  final String? filePath; // Single file (backward compatibility)
-  final Uint8List? fileBytes; // Single file (backward compatibility)
-  final List<Map<String, dynamic>>? filesList; // Multiple files
-  final String? audioPath;
-  final Duration? audioDuration;
-
-  const MessageBubble({
-    Key? key,
-    required this.message,
-    required this.isMe,
-    required this.time,
-    this.userImage,
-    required this.senderName,
-    this.imageBytes,
-    this.imageBytesList,
-    this.imageUrl,
-    this.fileName,
-    this.fileSize,
-    this.filePath,
-    this.fileBytes,
-    this.filesList,
-    this.audioPath,
-    this.audioDuration,
-  }) : super(key: key);
-
-  @override
-  State<MessageBubble> createState() => _MessageBubbleState();
-}
-
-class _MessageBubbleState extends State<MessageBubble> {
-  final AudioPlayer _audioPlayer = AudioPlayer();
-  bool _isPlaying = false;
-  Duration _currentPosition = Duration.zero;
-  Duration _totalDuration = Duration.zero;
-  Timer? _positionTimer;
-
-  @override
-  void initState() {
-    super.initState();
-    if (widget.audioPath != null) {
-      print('🎵 MessageBubble init: audioPath=${widget.audioPath}, audioDuration=${widget.audioDuration}');
-      
-      // Set initial duration from widget
-      if (widget.audioDuration != null) {
-        setState(() {
-          _totalDuration = widget.audioDuration!;
-        });
-        print('⏱️ Initial duration set: ${widget.audioDuration}');
-      }
-      
-      _audioPlayer.onPlayerStateChanged.listen((state) {
-        if (mounted) {
-          setState(() {
-            _isPlaying = state == PlayerState.playing;
-          });
-        }
-      });
-
-      _audioPlayer.onDurationChanged.listen((duration) {
-        if (mounted) {
-          print('⏱️ Duration changed: $duration');
-          // 0초로 변경되는 경우, 기존에 유효한 시간이 있다면 무시
-          if (duration == Duration.zero && _totalDuration > Duration.zero) {
-            print('⚠️ Ignoring zero duration update as we have valid duration: $_totalDuration');
-            return;
-          }
-          setState(() {
-            _totalDuration = duration;
-          });
-        }
-      });
-
-      _audioPlayer.onPositionChanged.listen((position) {
-        if (mounted) {
-          setState(() {
-            _currentPosition = position;
-          });
-        }
-      });
-
-      _audioPlayer.onPlayerComplete.listen((event) {
-        if (mounted) {
-          setState(() {
-            _isPlaying = false;
-            _currentPosition = Duration.zero;
-          });
-        }
-      });
-
-      // Load audio source to get actual duration
-      _loadAudioDuration();
-    }
-  }
-
-  Future<void> _loadAudioDuration() async {
-    try {
-      print('📂 Loading audio file: ${widget.audioPath}');
-      
-      // Web에서는 blob URL을 사용하므로 setSourceUrl 사용
-      if (widget.audioPath!.startsWith('blob:')) {
-        print('🌐 Using setSourceUrl for blob URL');
-        await _audioPlayer.setSourceUrl(widget.audioPath!);
-      } else {
-        print('📱 Using setSourceDeviceFile for file path');
-        await _audioPlayer.setSourceDeviceFile(widget.audioPath!);
-      }
-      
-      print('✅ Audio file loaded successfully');
-      // Duration will be set via onDurationChanged listener
-    } catch (e) {
-      print('❌ Error loading audio duration: $e');
-    }
-  }
-
-  @override
-  void dispose() {
-    _positionTimer?.cancel();
-    _audioPlayer.dispose();
-    super.dispose();
-  }
-
-  String _formatDuration(Duration duration) {
-    String twoDigits(int n) => n.toString().padLeft(2, '0');
-    final minutes = twoDigits(duration.inMinutes.remainder(60));
-    final seconds = twoDigits(duration.inSeconds.remainder(60));
-    return '$minutes:$seconds';
-  }
-
-  Future<void> _playPause() async {
-    if (_isPlaying) {
-      await _audioPlayer.pause();
-      _positionTimer?.cancel();
-      setState(() {
-        _isPlaying = false;
-      });
-    } else {
-      // Web에서는 blob URL을 사용하므로 UrlSource 사용
-      if (widget.audioPath!.startsWith('blob:')) {
-        await _audioPlayer.play(UrlSource(widget.audioPath!));
-      } else {
-        await _audioPlayer.play(DeviceFileSource(widget.audioPath!));
-      }
-      
-      setState(() {
-        _isPlaying = true;
-      });
-      
-      // Web에서 position 업데이트를 위한 타이머
-      _positionTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) async {
-        if (mounted && _isPlaying) {
-          final position = await _audioPlayer.getCurrentPosition();
-          final duration = await _audioPlayer.getDuration();
-          
-          if (mounted) {
-            setState(() {
-              if (position != null) _currentPosition = position;
-              if (duration != null && duration > Duration.zero) _totalDuration = duration;
-            });
-          }
-          
-          // 재생 완료 체크
-          if (position != null && duration != null && position >= duration) {
-            timer.cancel();
-            if (mounted) {
-              setState(() {
-                _isPlaying = false;
-                _currentPosition = Duration.zero;
-              });
-            }
-          }
-        }
-      });
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: Row(
-        mainAxisAlignment:
-            widget.isMe ? MainAxisAlignment.end : MainAxisAlignment.start,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (!widget.isMe) ...[
-            Container(
-              width: 36,
-              height: 36,
-              decoration: BoxDecoration(
-                color: Colors.grey[200],
-                shape: BoxShape.circle,
-                image: widget.userImage != null && widget.userImage!.isNotEmpty
-                    ? DecorationImage(
-                        image: NetworkImage(widget.userImage!),
-                        fit: BoxFit.cover,
-                      )
-                    : null,
-              ),
-              child: widget.userImage == null || widget.userImage!.isEmpty
-                  ? const Icon(Icons.person, size: 20, color: Colors.grey)
-                  : null,
-            ),
-            const SizedBox(width: 8),
-          ],
-          Column(
-            crossAxisAlignment:
-                widget.isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-            children: [
-              if (!widget.isMe) ...[
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 4),
-                  child: Text(
-                    widget.senderName,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: Colors.grey.shade600,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-              ],
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  if (widget.isMe) ...[ 
-                    Padding(
-                      padding: const EdgeInsets.only(right: 4),
-                      child: Text(
-                        '${widget.time.hour}:${widget.time.minute.toString().padLeft(2, '0')}',
-                        style: TextStyle(
-                          color: AppTheme.textSecondary,
-                          fontSize: 10,
-                        ),
-                      ),
-                    ),
-                  ],
-                  // 미디어 콘텐츠와 텍스트를 Column으로 분리
-                  Column(
-                    crossAxisAlignment: widget.isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-                    children: [
-                      // 이미지 표시 (말풍선 밖)
-                      if (widget.imageBytes != null || (widget.imageBytesList != null && widget.imageBytesList!.isNotEmpty)) ...[
-                        Builder(
-                          builder: (context) {
-                            final images = widget.imageBytesList ?? [widget.imageBytes!];
-                            
-                            if (images.length == 1) {
-                              return GestureDetector(
-                                onTap: () {
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => Scaffold(
-                                        appBar: AppBar(backgroundColor: Colors.black, iconTheme: const IconThemeData(color: Colors.white)),
-                                        backgroundColor: Colors.black,
-                                        body: Center(
-                                          child: Image.memory(images[0]),
-                                        ),
-                                      ),
-                                    ),
-                                  );
-                                },
-                                child: ClipRRect(
-                                  borderRadius: BorderRadius.circular(12),
-                                  child: ConstrainedBox(
-                                    constraints: const BoxConstraints(
-                                      maxWidth: 240,
-                                      maxHeight: 320,
-                                    ),
-                                    child: Image.memory(
-                                      images[0],
-                                      fit: BoxFit.contain,
-                                    ),
-                                  ),
-                                ),
-                              );
-                            }
-
-                            // Grid layout for multiple images
-                            return SizedBox(
-                              width: 240,
-                              child: Wrap(
-                                spacing: 4,
-                                runSpacing: 4,
-                                children: List.generate(images.length, (index) {
-                                  // Calculate size based on image count
-                                  double size;
-                                  if (images.length == 2 || images.length == 4) {
-                                    size = (240 - 4) / 2; // 2 columns
-                                  } else {
-                                    size = (240 - 8) / 3; // 3 columns
-                                  }
-
-                                  return GestureDetector(
-                                    onTap: () {
-                                      Navigator.push(
-                                        context,
-                                        MaterialPageRoute(
-                                          builder: (_) => Scaffold(
-                                            appBar: AppBar(backgroundColor: Colors.black, iconTheme: const IconThemeData(color: Colors.white)),
-                                            backgroundColor: Colors.black,
-                                            body: PageView.builder(
-                                              controller: PageController(initialPage: index),
-                                              itemCount: images.length,
-                                              itemBuilder: (context, pageIndex) {
-                                                return Center(
-                                                  child: Image.memory(
-                                                    images[pageIndex],
-                                                    errorBuilder: (context, error, stackTrace) {
-                                                      print('❌ Error displaying full screen image: $error');
-                                                      return const Icon(Icons.error, color: Colors.white);
-                                                    },
-                                                  ),
-                                                );
-                                              },
-                                            ),
-                                          ),
-                                        ),
-                                      );
-                                    },
-                                    child: ClipRRect(
-                                      borderRadius: BorderRadius.circular(8),
-                                      child: Image.memory(
-                                        images[index],
-                                        width: size,
-                                        height: size,
-                                        fit: BoxFit.cover,
-                                        errorBuilder: (context, error, stackTrace) {
-                                          print('❌ Error displaying grid image: $error');
-                                          return Container(
-                                            width: size,
-                                            height: size,
-                                            color: Colors.grey[300],
-                                            child: const Icon(Icons.broken_image, color: Colors.grey),
-                                          );
-                                        },
-                                      ),
-                                    ),
-                                  );
-                                }),
-                              ),
-                            );
-                          },
-                        ),
-                        if (widget.message.isNotEmpty) const SizedBox(height: 8),
-                      ],
-                      // 파일 표시 (말풍선 밖)
-                      // Multiple files support
-                      if (widget.filesList != null && widget.filesList!.isNotEmpty) ...[
-                        ...widget.filesList!.map((fileData) {
-                          final fileName = fileData['name'] as String?;
-                          final fileSize = fileData['size'] as int?;
-                          final fileBytes = fileData['bytes'] as Uint8List?;
-                          
-                          return Padding(
-                            padding: const EdgeInsets.only(bottom: 4.0),
-                            child: Container(
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: widget.isMe
-                                    ? const Color(0xFF0095F6)
-                                    : const Color(0xFFF0F0F0),
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    Icons.insert_drive_file,
-                                    color: widget.isMe ? Colors.white : Colors.blue,
-                                    size: 24,
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      if (fileName != null)
-                                        Text(
-                                          fileName,
-                                          style: TextStyle(
-                                            color: widget.isMe ? Colors.white : Colors.black,
-                                            fontSize: 14,
-                                            fontWeight: FontWeight.w500,
-                                          ),
-                                        ),
-                                      if (fileSize != null)
-                                        Text(
-                                          '${(fileSize / 1024).toStringAsFixed(1)} KB',
-                                          style: TextStyle(
-                                            color: widget.isMe
-                                                ? Colors.white.withValues(alpha: 0.8)
-                                                : Colors.grey[600],
-                                            fontSize: 12,
-                                          ),
-                                        ),
-                                    ],
-                                  ),
-                                  if (fileBytes != null && fileName != null) ...[ 
-                                    const SizedBox(width: 12),
-                                    IconButton(
-                                      icon: Icon(
-                                        Icons.download,
-                                        color: widget.isMe ? Colors.white : Colors.blue,
-                                        size: 24,
-                                      ),
-                                      onPressed: () async {
-                                        await FileDownloadHelper.downloadFile(
-                                          fileBytes: fileBytes,
-                                          fileName: fileName,
-                                        );
-                                        if (context.mounted) {
-                                          ScaffoldMessenger.of(context).showSnackBar(
-                                            SnackBar(
-                                              content: Text('$fileName 다운로드 완료'),
-                                              duration: const Duration(seconds: 2),
-                                            ),
-                                          );
-                                        }
-                                      },
-                                    ),
-                                  ],
-                                ],
-                              ),
-                            ),
-                          );
-                        }).toList(),
-                        if (widget.message.isNotEmpty) const SizedBox(height: 8),
-                      ]
-                      // Single file (backward compatibility)
-                      else if (widget.fileName != null) ...[
-                        Container(
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: widget.isMe
-                                ? const Color(0xFF0095F6)
-                                : const Color(0xFFF0F0F0),
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(
-                                Icons.insert_drive_file,
-                                color: widget.isMe ? Colors.white : Colors.blue,
-                                size: 24,
-                              ),
-                              const SizedBox(width: 12),
-                              Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    widget.fileName!,
-                                    style: TextStyle(
-                                      color: widget.isMe ? Colors.white : Colors.black,
-                                      fontSize: 14,
-                                      fontWeight: FontWeight.w500,
-                                    ),
-                                  ),
-                                  if (widget.fileSize != null)
-                                    Text(
-                                      '${(widget.fileSize! / 1024).toStringAsFixed(1)} KB',
-                                      style: TextStyle(
-                                        color: widget.isMe
-                                            ? Colors.white.withValues(alpha: 0.8)
-                                            : Colors.grey[600],
-                                        fontSize: 12,
-                                      ),
-                                    ),
-                                ],
-                              ),
-                              if (widget.fileBytes != null) ...[
-                                const SizedBox(width: 12),
-                                IconButton(
-                                  icon: Icon(
-                                    Icons.download,
-                                    color: widget.isMe ? Colors.white : Colors.blue,
-                                    size: 24,
-                                  ),
-                                  onPressed: () async {
-                                    if (widget.fileBytes != null && widget.fileName != null) {
-                                      await FileDownloadHelper.downloadFile(
-                                        fileBytes: widget.fileBytes!,
-                                        fileName: widget.fileName!,
-                                      );
-                                      if (context.mounted) {
-                                        ScaffoldMessenger.of(context).showSnackBar(
-                                          SnackBar(
-                                            content: Text('${widget.fileName} 다운로드 완료'),
-                                            duration: const Duration(seconds: 2),
-                                          ),
-                                        );
-                                      }
-                                    }
-                                  },
-                                  padding: EdgeInsets.zero,
-                                  constraints: const BoxConstraints(),
-                                ),
-                              ],
-                            ],
-                          ),
-                        ),
-                        if (widget.message.isNotEmpty) const SizedBox(height: 8),
-                      ],
-                      // 오디오 플레이어 (말풍선 밖)
-                      if (widget.audioPath != null) ...[
-                        Container(
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: widget.isMe
-                                ? const Color(0xFF0095F6)
-                                : const Color(0xFFF0F0F0),
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              IconButton(
-                                icon: Icon(
-                                  _isPlaying ? Icons.pause : Icons.play_arrow,
-                                  color: widget.isMe ? Colors.white : Colors.purple,
-                                  size: 28,
-                                ),
-                                onPressed: _playPause,
-                                padding: EdgeInsets.zero,
-                                constraints: const BoxConstraints(),
-                              ),
-                              const SizedBox(width: 12),
-                              Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    '음성 메모',
-                                    style: TextStyle(
-                                      color: widget.isMe ? Colors.white : Colors.black,
-                                      fontSize: 14,
-                                      fontWeight: FontWeight.w500,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  SizedBox(
-                                    width: 150,
-                                    child: LinearProgressIndicator(
-                                      value: (_totalDuration == Duration.zero && widget.audioDuration != null ? widget.audioDuration! : _totalDuration).inMilliseconds > 0
-                                          ? (_currentPosition.inMilliseconds / (_totalDuration == Duration.zero && widget.audioDuration != null ? widget.audioDuration! : _totalDuration).inMilliseconds).clamp(0.0, 1.0)
-                                          : 0.0,
-                                      backgroundColor: widget.isMe ? Colors.white.withValues(alpha: 0.3) : Colors.grey[300],
-                                      valueColor: AlwaysStoppedAnimation<Color>(widget.isMe ? Colors.white : Colors.purple),
-                                      minHeight: 2,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    '${_formatDuration(_currentPosition)} / ${_formatDuration(_totalDuration == Duration.zero && widget.audioDuration != null ? widget.audioDuration! : _totalDuration)}',
-                                    style: TextStyle(
-                                      color: widget.isMe
-                                          ? Colors.white.withValues(alpha: 0.8)
-                                          : Colors.grey[600],
-                                      fontSize: 12,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
-                        if (widget.message.isNotEmpty && widget.message != '음성 메모')
-                          const SizedBox(height: 8),
-                      ],
-                      // 텍스트 메시지 (말풍선 안)
-                      if (widget.message.isNotEmpty &&
-                          (widget.audioPath == null || widget.message != '음성 메모'))
-                        Container(
-                          constraints: BoxConstraints(
-                            maxWidth: MediaQuery.of(context).size.width * 0.7,
-                          ),
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 16, vertical: 12),
-                          decoration: BoxDecoration(
-                            color: widget.isMe
-                                ? const Color(0xFF0095F6)
-                                : const Color(0xFFF0F0F0),
-                            borderRadius: BorderRadius.only(
-                              topLeft: const Radius.circular(20),
-                              topRight: const Radius.circular(20),
-                              bottomLeft: Radius.circular(widget.isMe ? 20 : 4),
-                              bottomRight: Radius.circular(widget.isMe ? 4 : 20),
-                            ),
-                          ),
-                          child: Text(
-                            widget.message,
-                            style: TextStyle(
-                              color: widget.isMe ? Colors.white : Colors.black,
-                              fontSize: 15,
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
-                  if (!widget.isMe) ...[
-                    Padding(
-                      padding: const EdgeInsets.only(left: 4),
-                      child: Text(
-                        '${widget.time.hour}:${widget.time.minute.toString().padLeft(2, '0')}',
-                        style: TextStyle(
-                          color: AppTheme.textSecondary,
-                          fontSize: 10,
-                        ),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ],
-          ),
-        ],
       ),
     );
   }

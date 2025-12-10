@@ -1,0 +1,240 @@
+import 'dart:io';
+import 'package:dio/dio.dart';
+import 'package:http_parser/http_parser.dart';
+import 'api_client.dart';
+import '../core/constants/api_endpoints.dart';
+import 'models/agora_profile_response.dart';
+import 'models/create_agora_profile_request.dart';
+import 'models/update_agora_profile_request.dart';
+
+class ProfileService {
+  final ApiClient _apiClient;
+
+  ProfileService(this._apiClient);
+
+  /// GET - 내 Agora 프로필 조회
+  /// 프로필이 없으면 null 반환
+  Future<AgoraProfileResponse?> getMyProfile() async {
+    try {
+      final response = await _apiClient.get('/api/agora/profile');
+
+      // 서버에서 hasProfile: false로 프로필 없음을 알려주는 경우
+      if (response.data is Map<String, dynamic>) {
+        final data = response.data as Map<String, dynamic>;
+        if (data['hasProfile'] == false) {
+          return null;
+        }
+      }
+
+      return AgoraProfileResponse.fromJson(response.data);
+    } catch (e) {
+      throw _handleError(e);
+    }
+  }
+
+  /// POST - Agora 프로필 생성 (최초 설정)
+  Future<AgoraProfileResponse> createProfile(CreateAgoraProfileRequest request) async {
+    try {
+      final response = await _apiClient.post(
+        '/api/agora/profile',
+        data: request.toJson(),
+      );
+      return AgoraProfileResponse.fromJson(response.data);
+    } catch (e) {
+      throw _handleError(e);
+    }
+  }
+
+  /// PUT - Agora 프로필 수정
+  Future<AgoraProfileResponse> updateProfile(UpdateAgoraProfileRequest request) async {
+    try {
+      print('🔵 [ProfileService] 프로필 수정 요청 시작');
+      print('📤 요청 데이터: ${request.toJson()}');
+      
+      final response = await _apiClient.put(
+        '/api/agora/profile',
+        data: request.toJson(),
+      );
+      
+      print('✅ [ProfileService] 프로필 수정 성공');
+      print('📥 응답 데이터: ${response.data}');
+      
+      return AgoraProfileResponse.fromJson(response.data);
+    } catch (e) {
+      print('❌ [ProfileService] 프로필 수정 실패: $e');
+      throw _handleError(e);
+    }
+  }
+
+  /// PUT - 프로필 이미지 변경
+  /// 1. 파일 API로 이미지 업로드 → URL 받기
+  /// 2. 프로필 API로 URL 전달
+  Future<void> updateProfileImage(File imageFile) async {
+    try {
+      print('🔵 [ProfileService] 프로필 이미지 업데이트 시작');
+      print('📤 이미지 파일: ${imageFile.path}');
+
+      // 1. 파일 API로 이미지 업로드
+      String fileName = imageFile.path.split('/').last;
+
+      FormData formData = FormData.fromMap({
+        'file': await MultipartFile.fromFile(
+          imageFile.path,
+          filename: fileName,
+          contentType: MediaType('image', 'jpeg'),
+        ),
+      });
+
+      final uploadResponse = await _apiClient.dio.post(
+        '/api/agora/files/upload-image',
+        data: formData,
+      );
+
+      print('✅ [ProfileService] 이미지 업로드 성공: ${uploadResponse.data}');
+
+      // 2. 반환받은 URL로 프로필 이미지 업데이트
+      // 서버가 'fileUrl' 또는 'url'로 반환
+      var imageUrl = (uploadResponse.data['fileUrl'] ?? uploadResponse.data['url']) as String?;
+      if (imageUrl == null) {
+        throw '이미지 URL을 받지 못했습니다.';
+      }
+
+      // 상대 경로인 경우 전체 URL로 변환
+      if (imageUrl.startsWith('/')) {
+        imageUrl = '${ApiEndpoints.baseUrl}$imageUrl';
+      }
+
+      print('📤 [ProfileService] 프로필 이미지 URL: $imageUrl');
+
+      await _apiClient.put(
+        '/api/agora/profile/image',
+        data: {'profileImage': imageUrl},
+      );
+
+      print('✅ [ProfileService] 프로필 이미지 업데이트 성공');
+    } catch (e) {
+      print('❌ [ProfileService] 프로필 이미지 업데이트 실패: $e');
+      throw _handleError(e);
+    }
+  }
+
+  /// GET - 다른 사용자 프로필 조회
+  Future<AgoraProfileResponse> getUserProfile(String agoraId) async {
+    try {
+      final response = await _apiClient.get('/api/agora/profile/$agoraId');
+      return AgoraProfileResponse.fromJson(response.data);
+    } catch (e) {
+      throw _handleError(e);
+    }
+  }
+
+  /// GET - 사용자 검색 (keyword로 agoraId, displayName 통합 검색)
+  Future<List<AgoraProfileResponse>> searchUsers({
+    required String keyword,
+  }) async {
+    try {
+      final response = await _apiClient.get(
+        '/api/agora/profile/search',
+        queryParameters: {'keyword': keyword},
+      );
+
+      // 서버가 페이지네이션 응답 { content: [...] } 형태로 반환
+      final data = response.data;
+      List<dynamic> users;
+
+      if (data is List) {
+        users = data;
+      } else if (data is Map && data['content'] != null) {
+        users = data['content'] as List;
+      } else {
+        users = [];
+      }
+
+      return users
+          .map((json) => AgoraProfileResponse.fromJson(json as Map<String, dynamic>))
+          .toList();
+    } catch (e) {
+      throw _handleError(e);
+    }
+  }
+
+  /// GET - agoraId 중복 확인
+  Future<bool> checkAgoraIdAvailable(String agoraId) async {
+    try {
+      print('🔵 [ProfileService] agoraId 중복 확인 시작: $agoraId');
+      
+      final response = await _apiClient.get(
+        '/api/agora/profile/check-id',
+        queryParameters: {'agoraId': agoraId},
+      );
+      
+      print('✅ [ProfileService] 응답 상태: ${response.statusCode}');
+      print('📥 [ProfileService] 응답 데이터: ${response.data}');
+      print('📥 [ProfileService] 응답 타입: ${response.data.runtimeType}');
+      
+      // 서버 응답 구조에 따라 조정 필요
+      if (response.data is Map) {
+        final available = response.data['available'] ?? false;
+        print('✅ [ProfileService] available 값: $available');
+        return available;
+      }
+      
+      print('✅ [ProfileService] Map이 아님, statusCode로 판단: ${response.statusCode}');
+      return response.statusCode == 200;
+    } catch (e) {
+      print('❌ [ProfileService] agoraId 중복 확인 에러: $e');
+      
+      if (e is DioException) {
+        print('❌ [ProfileService] DioException 상태코드: ${e.response?.statusCode}');
+        print('❌ [ProfileService] DioException 응답: ${e.response?.data}');
+        
+        if (e.response?.statusCode == 409) {
+          print('⚠️ [ProfileService] 409 에러 - 이미 존재하는 ID');
+          return false; // 이미 존재하는 ID
+        }
+      }
+      
+      throw _handleError(e);
+    }
+  }
+
+  /// 에러 핸들링
+  String _handleError(dynamic error) {
+    if (error is DioException) {
+      if (error.response != null) {
+        final statusCode = error.response?.statusCode;
+        
+        // message 필드를 안전하게 추출
+        String? message;
+        try {
+          final responseData = error.response?.data;
+          if (responseData is Map<String, dynamic>) {
+            final messageValue = responseData['message'];
+            message = messageValue?.toString();
+          }
+        } catch (e) {
+          print('⚠️ Error parsing message: $e');
+        }
+        
+        switch (statusCode) {
+          case 400:
+            return message ?? '잘못된 요청입니다.';
+          case 401:
+            return '인증이 필요합니다.';
+          case 403:
+            return '권한이 없습니다.';
+          case 404:
+            return '프로필을 찾을 수 없습니다.';
+          case 409:
+            return message ?? '이미 존재하는 데이터입니다.';
+          case 500:
+            return '서버 오류가 발생했습니다.';
+          default:
+            return message ?? '알 수 없는 오류가 발생했습니다.';
+        }
+      }
+      return '네트워크 연결을 확인해주세요.';
+    }
+    return '알 수 없는 오류가 발생했습니다.';
+  }
+}

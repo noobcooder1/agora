@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'api_client.dart';
@@ -28,9 +27,14 @@ class AuthService {
           'message': response.data['message'],
         };
       } else {
+        String errorMessage = response.data['error'] ?? '회원가입 실패';
+        if (errorMessage.toLowerCase().contains('already registered') || 
+            errorMessage.toLowerCase().contains('already exists')) {
+          errorMessage = '이미 존재하는 이메일입니다.';
+        }
         return {
           'success': false,
-          'message': response.data['error'] ?? '회원가입 실패',
+          'message': errorMessage,
         };
       }
     } on DioException catch (e) {
@@ -40,9 +44,15 @@ class AuthService {
           'message': '이미 존재하는 이메일입니다.',
         };
       }
+      if (e.response?.statusCode == 400) {
+        return {
+          'success': false,
+          'message': e.response?.data['error'] ?? '입력 정보를 확인해주세요.',
+        };
+      }
       return {
         'success': false,
-        'message': '서버 연결 실패: ${e.message}',
+        'message': '요청 처리 중 오류가 발생했습니다.',
       };
     }
   }
@@ -58,6 +68,7 @@ class AuthService {
         data: {
           'email': email,
           'password': password,
+          'client_id': 'client_1764203523169_8192',
         },
       );
 
@@ -92,9 +103,15 @@ class AuthService {
           'message': '존재하지 않는 계정입니다.',
         };
       }
+      if (e.response?.statusCode == 400) {
+        return {
+          'success': false,
+          'message': e.response?.data['error'] ?? '입력 정보를 확인해주세요.',
+        };
+      }
       return {
         'success': false,
-        'message': '서버 연결 실패: ${e.message}',
+        'message': '요청 처리 중 오류가 발생했습니다.',
       };
     }
   }
@@ -160,7 +177,7 @@ class AuthService {
       }
       return {
         'success': false,
-        'message': '서버 연결 실패: ${e.message}',
+        'message': '데이터를 불러오는 중 오류가 발생했습니다.',
       };
     }
   }
@@ -201,7 +218,7 @@ class AuthService {
     } on DioException catch (e) {
       return {
         'success': false,
-        'message': '서버 연결 실패: ${e.message}',
+        'message': '토큰 갱신에 실패했습니다. 다시 로그인해주세요.',
       };
     }
   }
